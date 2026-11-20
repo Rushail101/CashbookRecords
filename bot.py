@@ -22,6 +22,10 @@ Flow:
         /cash paid 500 lunch with client
         /cash received 2000 rent from tenant
   - /today or /month -> quick spoken summary.
+  - After a payment is logged, the bot asks "Do you have a bill for this?"
+    (Yes / No buttons). Yes -> send a photo or PDF of the bill and it is
+    stored in the cashbook-photos bucket under bills/, linked to that entry
+    through cashbook_entries.bill_path. No -> nothing more is asked.
 
 State (offset, pending entries) lives in Supabase, so cron runs stay stateless
 on disk.
@@ -47,10 +51,13 @@ from PIL import Image
 import pytesseract
 
 # ── config ──────────────────────────────────────────────────────────
-TELEGRAM_TOKEN = "8681871670:AAGyvHzV8dAzYFTvmjOa5YcrXRxWqMmmy6o"
-ALLOWED_USER_ID = "1070508553"
-SUPABASE_URL = "https://wzwpeuwhuyvqgltrafre.supabase.co"
-SUPABASE_SERVICE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Ind6d3BldXdodXl2cWdsdHJhZnJlIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3OTM2MTExNSwiZXhwIjoyMDk0OTM3MTE1fQ.otjPQQorCg8lvqa4IeWI2v3JhW8AkJJFfrvRdnc-ICc"
+# Read from the environment (.env on the VPS, repo secrets on GitHub Actions).
+# Never hard-code these: the service key has full access to the database.
+TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+ALLOWED_USER_ID = os.environ["ALLOWED_TELEGRAM_USER_ID"].strip()
+SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
+SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
+PHOTO_BUCKET = "cashbook-photos"
 
 TG_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 SB_HEADERS = {
@@ -117,20 +124,55 @@ def set_last_offset(offset):
         sb_post("bot_state", {"key": "last_update_id", "value": str(offset)})
 
 
-def upload_photo(content, ext):
-    filename = f"{uuid.uuid4()}.{ext}"
+CONTENT_TYPES = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png", "webp": "image/webp", "pdf": "application/pdf"}
+
+
+def upload_photo(content, ext, folder=""):
+    """Upload a file to the storage bucket. Returns its path inside the bucket."""
+    ext = (ext or "jpg").lower()
+    filename = f"{folder}{uuid.uuid4()}.{ext}"
     r = requests.post(
-        f"{SUPABASE_URL}/storage/v1/object/cashbook-photos/{filename}",
+        f"{SUPABASE_URL}/storage/v1/object/{PHOTO_BUCKET}/{filename}",
         headers={
             "apikey": SUPABASE_SERVICE_KEY,
             "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
-            "Content-Type": "image/jpeg",
+            "Content-Type": CONTENT_TYPES.get(ext, "application/octet-stream"),
         },
         data=content,
         timeout=60,
     )
     r.raise_for_status()
     return filename
+
+
+# ── bill follow-up state ─────────────────────────────────────────────
+# After an entry is logged the bot asks "Do you have a bill for this?".
+# What it is waiting for lives in bot_state under bill_wait:<chat_id>,
+# as "<stage>:<entry id>", where stage is "ask" (waiting for yes/no)
+# or "photo" (waiting for the bill photo).
+def _bill_key(chat_id):
+    return f"bill_wait:{chat_id}"
+
+
+def get_bill_wait(chat_id):
+    rows = sb_get("bot_state", params={"key": f"eq.{_bill_key(chat_id)}", "select": "value"})
+    if not rows or not rows[0].get("value"):
+        return None
+    stage, _, entry_id = rows[0]["value"].partition(":")
+    return {"stage": stage, "entry_id": entry_id}
+
+
+def set_bill_wait(chat_id, stage, entry_id):
+    key = _bill_key(chat_id)
+    value = f"{stage}:{entry_id}"
+    if sb_get("bot_state", params={"key": f"eq.{key}"}):
+        sb_patch("bot_state", {"value": value}, params={"key": f"eq.{key}"})
+    else:
+        sb_post("bot_state", {"key": key, "value": value})
+
+
+def clear_bill_wait(chat_id):
+    sb_delete("bot_state", params={"key": f"eq.{_bill_key(chat_id)}"})
 
 
 def get_oldest_pending(chat_id):
@@ -152,8 +194,19 @@ def tg_get_updates(offset):
     return r.json().get("result", [])
 
 
-def tg_send_message(chat_id, text):
-    requests.post(f"{TG_API}/sendMessage", json={"chat_id": chat_id, "text": text}, timeout=30)
+YES_NO_KEYBOARD = {
+    "keyboard": [[{"text": "Yes"}, {"text": "No"}]],
+    "one_time_keyboard": True,
+    "resize_keyboard": True,
+}
+REMOVE_KEYBOARD = {"remove_keyboard": True}
+
+
+def tg_send_message(chat_id, text, reply_markup=None):
+    payload = {"chat_id": chat_id, "text": text}
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
+    requests.post(f"{TG_API}/sendMessage", json=payload, timeout=30)
 
 
 def tg_download_file(file_id):
@@ -308,7 +361,8 @@ def finalize_pending(pending, reply_text):
         "telegram_user_id": pending["telegram_user_id"],
         "raw_extraction": extracted,
     }
-    sb_post("cashbook_entries", row)
+    inserted = sb_post("cashbook_entries", row)
+    row["id"] = inserted[0]["id"] if inserted else None
     delete_pending(pending["id"])
     return row
 
@@ -327,8 +381,79 @@ def handle_cash_command(chat_id, user_id, text):
         "payment_app": "cash",
         "telegram_user_id": user_id,
     }
-    sb_post("cashbook_entries", row)
+    inserted = sb_post("cashbook_entries", row)
     tg_send_message(chat_id, f"Logged ₹{amount_str} ({direction}, cash) — {note.strip()}")
+    if inserted and direction.lower() == "paid":
+        ask_for_bill(chat_id, inserted[0]["id"])
+
+
+# ── bills ───────────────────────────────────────────────────────────
+YES_WORDS = {"yes", "y", "haan", "ha", "han"}
+NO_WORDS = {"no", "n", "nahi", "skip", "cancel"}
+
+
+def ask_for_bill(chat_id, entry_id):
+    set_bill_wait(chat_id, "ask", entry_id)
+    tg_send_message(chat_id, "Do you have a bill for this?", reply_markup=YES_NO_KEYBOARD)
+
+
+def bill_file_from_message(msg):
+    """Return the Telegram file_id of a bill photo, image file or PDF in msg, or None."""
+    if "photo" in msg:
+        return msg["photo"][-1]["file_id"]  # largest resolution
+    doc = msg.get("document")
+    if doc:
+        mime = doc.get("mime_type") or ""
+        if mime.startswith("image/") or mime == "application/pdf":
+            return doc["file_id"]
+    return None
+
+
+def save_bill(chat_id, entry_id, file_id):
+    content, ext = tg_download_file(file_id)
+    path = upload_photo(content, ext, folder="bills/")
+    sb_patch("cashbook_entries", {"bill_path": path}, params={"id": f"eq.{entry_id}"})
+    clear_bill_wait(chat_id)
+    tg_send_message(chat_id, "Bill saved with this entry.", reply_markup=REMOVE_KEYBOARD)
+
+
+def handle_bill_flow(msg, chat_id, wait):
+    """Handle a message while a bill question is open. Returns True if it used the message."""
+    text = (msg.get("text") or "").strip()
+    word = text.lower().rstrip(".!")
+
+    if word in NO_WORDS:
+        clear_bill_wait(chat_id)
+        tg_send_message(chat_id, "OK, no bill for this one.", reply_markup=REMOVE_KEYBOARD)
+        return True
+
+    if wait["stage"] == "ask":
+        if word in YES_WORDS:
+            set_bill_wait(chat_id, "photo", wait["entry_id"])
+            tg_send_message(
+                chat_id,
+                "Send a photo of the bill (a PDF works too). Reply No to skip.",
+                reply_markup=REMOVE_KEYBOARD,
+            )
+            return True
+        # Anything else (a new screenshot, /cash, a reply to another entry)
+        # means you've moved on: drop the question and handle it normally.
+        clear_bill_wait(chat_id)
+        return False
+
+    # stage == "photo": the next photo or PDF is the bill.
+    file_id = bill_file_from_message(msg)
+    if file_id:
+        try:
+            save_bill(chat_id, wait["entry_id"], file_id)
+        except Exception as e:  # noqa: BLE001 - cron job, keep going next run
+            tg_send_message(chat_id, f"Couldn't save that bill, try sending it again.\n({e})")
+        return True
+    if text.startswith("/"):
+        clear_bill_wait(chat_id)
+        return False
+    tg_send_message(chat_id, "Waiting for the bill photo. Send it now, or reply No to skip.")
+    return True
 
 
 def handle_text(msg, chat_id, user_id, text):
@@ -347,6 +472,8 @@ def handle_text(msg, chat_id, user_id, text):
             tg_send_message(chat_id, "Still need an amount. Reply like: 500 paid lunch with client")
             return
         tg_send_message(chat_id, f"Logged ₹{row['amount']:g} ({row['direction']}) — {row['note']}")
+        if row.get("id") and row["direction"] == "paid":
+            ask_for_bill(chat_id, row["id"])
         return
 
     tg_send_message(
@@ -358,8 +485,12 @@ def handle_text(msg, chat_id, user_id, text):
 def process_message(msg):
     chat_id = msg["chat"]["id"]
     user_id = msg["from"]["id"]
-    if user_id != ALLOWED_USER_ID:
+    if str(user_id) != ALLOWED_USER_ID:  # Telegram sends the id as a number
         return  # ignore anyone who isn't you
+
+    wait = get_bill_wait(chat_id)
+    if wait and handle_bill_flow(msg, chat_id, wait):
+        return
 
     if "photo" in msg:
         handle_photo(msg, chat_id, user_id)

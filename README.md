@@ -72,6 +72,18 @@ That polls Telegram once a minute, processes anything new, and exits — no long
 ```
 Format is always `/cash <paid|received> <amount> <note...>`.
 
+**Bills:**
+After every payment is logged (screenshot or `/cash paid ...`), the bot asks
+"Do you have a bill for this?" with Yes / No buttons.
+- Tap **Yes**, then send a photo of the bill (or a PDF / image file). It's saved
+  in the `cashbook-photos` bucket under `bills/` and linked to that entry in the
+  `bill_path` column.
+- Tap **No** (or reply "skip") and nothing more is asked.
+- If you ignore the question and send a new screenshot or `/cash` command, the
+  question is dropped and the new entry is handled as usual.
+
+One-time setup: run `migrations/001_add_bill_path.sql` in the Supabase SQL Editor.
+
 **Quick totals:**
 `/today` or `/month` in the chat.
 
